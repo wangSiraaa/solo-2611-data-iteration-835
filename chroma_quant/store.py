@@ -118,9 +118,25 @@ CREATE TABLE IF NOT EXISTS analyses (
     PRIMARY KEY (analysis_id, component_name)
 );
 
+CREATE TABLE IF NOT EXISTS sync_products (
+    sync_id     TEXT PRIMARY KEY,
+    created_at  TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    payload     TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS blend_plans (
+    plan_id     TEXT PRIMARY KEY,
+    sync_id     TEXT NOT NULL REFERENCES sync_products(sync_id),
+    header_json TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    payload     TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_products_fp ON products(fingerprint);
 CREATE INDEX IF NOT EXISTS idx_analyses_lookup
     ON analyses(method_id, product_id);
+CREATE INDEX IF NOT EXISTS idx_blend_plans_sync ON blend_plans(sync_id);
 """
 
 

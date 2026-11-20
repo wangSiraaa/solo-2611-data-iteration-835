@@ -77,10 +77,143 @@ def main() -> None:
     r_ext = ext_repo.run_analysis("OVL", pid)
     print("\n外部库分析与原库一致: "
           f"{abs(r_ext.total_area - r2.total_area) < 1e-12}")
-    print(f"演示文件保留在: {workdir}")
     svc.close()
     repo.close()
     ext_repo.close()
+
+    meter_demo(workdir)
+    print(f"演示文件保留在: {workdir}")
+
+
+# ----------------------------------------------------------------------
+# 多路净响应同步统计与受限读数合成（端到端）
+# ----------------------------------------------------------------------
+def meter_demo(workdir: str) -> None:
+    from .blend import make_header
+    from .errors import DomainError
+    from .meter_service import MeterService
+
+    print("== 多路同步统计与受限合成 ==")
+    db = os.path.join(workdir, "meter.sqlite")
+    svc = SignalService(db)
+    # A: 净响应 t；B: 净响应 2−t；公共时间 [0,2]，两路无缺口
+    svc.create_run("MA", [(0, 0), (1, 1), (2, 2)])
+    svc.add_baseline("MA", [(0, 0), (2, 0)])
+    pa = svc.publish_product("MA")
+    svc.create_run("MB", [(0, 2), (1, 1), (2, 0)])
+    svc.add_baseline("MB", [(0, 0), (2, 0)])
+    pb = svc.publish_product("MB")
+    # C: 净响应 u，但时钟是非线性的：通道 [0,1]→公共 [0,2]、
+    #    通道 [1,2]→公共 [2,3]（分段线性锚点映射）
+    svc.create_run("MC", [(0, 0), (1, 1), (2, 2)])
+    svc.add_baseline("MC", [(0, 0), (2, 0)])
+    pc = svc.publish_product("MC")
+    # D: 净响应 τ，公共时间 [0,3]
+    svc.create_run("MD", [(0, 0), (3, 3)])
+    svc.add_baseline("MD", [(0, 0), (3, 0)])
+    pd = svc.publish_product("MD")
+    # E/F/G: 三路仅两两有交叠（恒定读数 1，有效窗错开）
+    wins = {"ME": [[0, 2]], "MF": [[1, 3]], "MG": [["5/2", 4]]}
+    prods = {}
+    for run in wins:
+        svc.create_run(run, [(0, 1), (4, 1)])
+        svc.add_baseline(run, [(0, 0), (4, 0)])
+        prods[run] = svc.publish_product(run)
+
+    ms = MeterService(db)
+    sel_ab = [
+        {"name": "A", "product_id": pa.product_id, "windows": [[0, 2]],
+         "clock": [[0, 0], [2, 2]]},
+        {"name": "B", "product_id": pb.product_id, "windows": [[0, 2]],
+         "clock": [[0, 0], [2, 2]]},
+    ]
+    stats = ms.compute_sync(sel_ab, 0, 2)
+    _print_sync("A,B 同步统计（公共时间 0..2）", stats)
+
+    print("-- 表头 H0: D=4，无附加噪声，份额任意 --")
+    plan = ms.optimize(stats.sync_id, make_header("H0", ["A", "B"], 4))
+    _print_plan(plan)
+    print("-- 同一统计产品换表头 H1: A 至少 3 份（不重读折线） --")
+    plan1 = ms.optimize(stats.sync_id,
+                        make_header("H1", ["A", "B"], 4, min_shares=[3, 0]))
+    _print_plan(plan1)
+
+    print("-- 固定 H0，B 的源信号改为恒定 1 --")
+    svc.create_run("MB1", [(0, 1), (2, 1)])
+    svc.add_baseline("MB1", [(0, 0), (2, 0)])
+    pb1 = svc.publish_product("MB1")
+    stats_b1 = ms.compute_sync(
+        [sel_ab[0], dict(sel_ab[1], product_id=pb1.product_id)], 0, 2)
+    _print_plan(ms.optimize(stats_b1.sync_id,
+                            make_header("H0", ["A", "B"], 4)))
+
+    print("-- 非线性时钟通道 C 与 D 的同步统计（公共时间 0..3） --")
+    stats_cd = ms.compute_sync([
+        {"name": "C", "product_id": pc.product_id, "windows": [[0, 2]],
+         "clock": [[0, 0], [1, 2], [2, 3]]},
+        {"name": "D", "product_id": pd.product_id, "windows": [[0, 3]],
+         "clock": [[0, 0], [3, 3]]},
+    ], 0, 3)
+    _print_sync("C,D 同步统计", stats_cd)
+
+    print("-- 三路仅两两有交叠：整组无共同测度，重新选路 --")
+    sel3 = [{"name": r[1:], "product_id": prods[r].product_id,
+             "windows": wins[r], "clock": [[0, 0], [4, 4]]}
+            for r in ("ME", "MF", "MG")]
+    try:
+        ms.compute_sync(sel3, 0, 4)
+        print("  意外成功？！")
+    except DomainError as exc:
+        print(f"  三路同选被拒绝: {exc}")
+    _print_sync("重选 E,F", ms.compute_sync(sel3[:2], 0, 4))
+
+    print("-- 两路恒定读数 + 独立读出噪声（D=2，σ²=1） --")
+    stats_ef = ms.compute_sync(sel3[:2], 0, 4)
+    _print_plan(ms.optimize(stats_ef.sync_id, make_header(
+        "HN", ["E", "F"], 2, noise_variances=[1, 1])))
+
+    print("-- 不可配表头：两路下限 3+3 > D=4 --")
+    bad = ms.optimize(stats.sync_id, make_header(
+        "HBAD", ["A", "B"], 4, min_shares=[3, 3]))
+    print(f"  feasible={bad.feasible}  原因: {bad.reason}")
+
+    # 离线交换：统计产品导出 JSON，在没有任何折线产品的新库中合成
+    exported = ms.export_sync_json(stats.sync_id)
+    off_db = os.path.join(workdir, "offline.sqlite")
+    ms_off = MeterService(off_db)
+    sid = ms_off.import_sync(json.loads(exported))
+    plan_off = ms_off.optimize(sid, make_header("H0", ["A", "B"], 4))
+    print(f"-- 离线交换: 新库（无折线产品）复算份额 "
+          f"{plan_off.shares}，方差 {plan_off.variance}，"
+          f"plan_id 一致={plan_off.plan_id == plan.plan_id} --\n")
+    ms_off.close()
+    ms.close()
+    svc.close()
+
+
+def _print_sync(title: str, stats) -> None:
+    print(f"== {title} ==")
+    print(f"  sync_id: {stats.sync_id}")
+    print(f"  共同有效段: "
+          f"{[(str(lo), str(hi)) for lo, hi in stats.common_segments]}"
+          f"  测长={stats.total_length}")
+    print(f"  各通道版本: "
+          f"{[(c.name, c.baseline_version) for c in stats.channels]}")
+    print(f"  均值: {[str(m) for m in stats.means]}")
+    print(f"  总体协方差: "
+          f"{[[str(x) for x in row] for row in stats.covariance]}")
+
+
+def _print_plan(plan) -> None:
+    if not plan.feasible:
+        print(f"  不可配: {plan.reason}")
+        return
+    print(f"  份额 {plan.shares}  权重 {[str(w) for w in plan.weights]}"
+          f"  预期均值 {plan.expected_mean}  波动方差 {plan.variance}")
+    nonzero = [t for t in plan.terms if t.value != 0]
+    if nonzero:
+        print("  非零贡献: " + ", ".join(
+            f"{t.label}={t.value}" for t in nonzero))
 
 
 def _signal_y(t: int) -> int:

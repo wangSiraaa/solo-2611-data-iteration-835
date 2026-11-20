@@ -11,9 +11,13 @@ from fractions import Fraction as F
 
 from .errors import DomainError, LimitError, ValidationError
 from .integration import adaptive_simpson_float, composite_simpson_fraction
+from .meter_service import MeterService
+from .blend import make_header, optimize_blend
 from .quant import product_from_dict, product_to_dict
 from .repository import QuantRepository
 from .signal_service import SignalService
+from .sync import (compute_sync_stats, make_channel_spec, make_clock,
+                   sync_stats_from_dict, sync_stats_to_dict)
 
 TOL = 1e-8
 results: list[tuple[str, bool, str]] = []
@@ -567,6 +571,477 @@ def case_generic_cross_check(db: str) -> None:
     svc.close()
 
 
+# ----------------------------------------------------------------------
+# 多路同步统计与受限合成（S 系列）
+# ----------------------------------------------------------------------
+def _mk_product(svc: SignalService, run: str, samples, anchors):
+    svc.create_run(run, samples)
+    v = svc.add_baseline(run, anchors)
+    return svc.publish_product(run, v)
+
+
+def _sync_float_cross_check(specs, stats) -> float:
+    """独立路径：直接对 net(clock^{-1}(τ)) 自适应 Simpson 数值积分，
+    复核同步统计的二阶矩（不经过 mapped_net 的复合代码）。"""
+    max_gap = 0.0
+    for i in range(len(specs)):
+        for j in range(i, len(specs)):
+            def f(tau, i=i, j=j):
+                t = F(tau)  # float 的二进制精确值
+                return (float(specs[i].product.net(
+                            specs[i].clock.to_channel(t)))
+                        * float(specs[j].product.net(
+                            specs[j].clock.to_channel(t))))
+            got = sum(
+                adaptive_simpson_float(f, float(lo), float(hi), tol=1e-13)
+                for lo, hi in stats.common_segments)
+            max_gap = max(max_gap,
+                          abs(got - float(stats.second_moments[i][j])))
+    return max_gap
+
+
+# S1：题面手算例 A=t、B=2−t、D=4
+def case_sync_worked_example(db: str) -> None:
+    svc = SignalService(db)
+    pa = _mk_product(svc, "SA", [(0, 0), (1, 1), (2, 2)], [(0, 0), (2, 0)])
+    pb = _mk_product(svc, "SB", [(0, 2), (1, 1), (2, 0)], [(0, 0), (2, 0)])
+    svc.close()
+    ms = MeterService(db)
+    sel = [
+        {"name": "A", "product_id": pa.product_id, "windows": [[0, 2]],
+         "clock": [[0, 0], [2, 2]]},
+        {"name": "B", "product_id": pb.product_id, "windows": [[0, 2]],
+         "clock": [[0, 0], [2, 2]]},
+    ]
+    stats = ms.compute_sync(sel, 0, 2)
+    check("S1 共同有效段", stats.common_segments == ((F(0), F(2)),),
+          str(stats.common_segments))
+    check("S1 总测长=2", stats.total_length == F(2))
+    check("S1 均值手算", stats.means == (F(1), F(1)), str(stats.means))
+    check("S1 一阶矩积分", stats.first_moments == (F(2), F(2)))
+    check("S1 两两乘积积分",
+          stats.second_moments[0][0] == F(8, 3)
+          and stats.second_moments[0][1] == F(4, 3)
+          and stats.second_moments[1][1] == F(8, 3))
+    check("S1 总体协方差手算",
+          stats.covariance == ((F(1, 3), F(-1, 3)),
+                               (F(-1, 3), F(1, 3))),
+          str(stats.covariance))
+    check("S1 各通道版本入档",
+          [c.baseline_version for c in stats.channels] == [1, 1]
+          and stats.channels[0].product_id == pa.product_id)
+
+    plan = ms.optimize(stats.sync_id, make_header("H1", ["A", "B"], 4))
+    check("S1 最优各两份", plan.shares == (2, 2), str(plan.shares))
+    check("S1 合成方差为0", plan.variance == F(0))
+    check("S1 预期均值=1", plan.expected_mean == F(1))
+    check("S1 枚举配置数=5", plan.configurations == 5)
+    check("S1 交叉项求和=方差",
+          sum(t.value for t in plan.terms) == plan.variance)
+    # 固定统计产品换表头：A 至少三份（只读已存统计，不重读折线）
+    plan2 = ms.optimize(stats.sync_id,
+                        make_header("H2", ["A", "B"], 4, min_shares=[3, 0]))
+    check("S1 A至少三份→3:1", plan2.shares == (3, 1), str(plan2.shares))
+    check("S1 方差=1/12", plan2.variance == F(1, 12), str(plan2.variance))
+    check("S1 两方案同一统计产品",
+          plan.sync_id == plan2.sync_id and plan.plan_id != plan2.plan_id)
+    # 指纹核查与篡改拒绝
+    d = sync_stats_to_dict(stats)
+    again = sync_stats_from_dict(d)
+    check("S1 导出重组指纹一致",
+          again.fingerprint == stats.fingerprint
+          and again.sync_id == stats.sync_id)
+    bad = dict(d)
+    bad["second_moments"] = [["8/1", "4/3"], ["4/3", "8/3"]]
+    try:
+        sync_stats_from_dict(bad)
+        check("S1 篡改矩被拒绝", False)
+    except ValidationError:
+        check("S1 篡改矩被拒绝", True)
+    bad2 = dict(d)
+    bad2["means"] = ["9/1", "1/1"]
+    try:
+        sync_stats_from_dict(bad2)
+        check("S1 篡改派生量被拒绝", False)
+    except ValidationError:
+        check("S1 篡改派生量被拒绝", True)
+    ms.close()
+
+
+# S2：固定原表头，B 的源信号改为恒定 1 → 全部选 B
+def case_sync_constant_channel(db: str) -> None:
+    svc = SignalService(db)
+    pa = _mk_product(svc, "CA", [(0, 0), (1, 1), (2, 2)], [(0, 0), (2, 0)])
+    pb = _mk_product(svc, "CB", [(0, 1), (1, 1), (2, 1)], [(0, 0), (2, 0)])
+    svc.close()
+    ms = MeterService(db)
+    sel = [
+        {"name": "A", "product_id": pa.product_id, "windows": [[0, 2]],
+         "clock": [[0, 0], [2, 2]]},
+        {"name": "B", "product_id": pb.product_id, "windows": [[0, 2]],
+         "clock": [[0, 0], [2, 2]]},
+    ]
+    stats = ms.compute_sync(sel, 0, 2)
+    check("S2 恒定路方差与协方差为0",
+          stats.covariance[1][1] == 0 and stats.covariance[0][1] == 0
+          and stats.covariance[0][0] == F(1, 3))
+    plan = ms.optimize(stats.sync_id, make_header("H1", ["A", "B"], 4))
+    check("S2 固定表头全选恒定路", plan.shares == (0, 4), str(plan.shares))
+    check("S2 方差0均值1",
+          plan.variance == 0 and plan.expected_mean == 1)
+    ms.close()
+
+
+# S3：非线性时钟段（分段线性锚点映射，斜率变化）
+def case_sync_nonlinear_clock(db: str) -> None:
+    svc = SignalService(db)
+    pc = _mk_product(svc, "NLC", [(0, 0), (1, 1), (2, 2)], [(0, 0), (2, 0)])
+    pd = _mk_product(svc, "NLD", [(0, 0), (3, 3)], [(0, 0), (3, 0)])
+    svc.close()
+    # C：净响应 u（通道时钟），时钟 (0,0),(1,2),(2,3)：两段斜率 2 与 1
+    spec_c = make_channel_spec("C", pc, [(0, 2)],
+                               make_clock([(0, 0), (1, 2), (2, 3)]))
+    spec_d = make_channel_spec("D", pd, [(0, 3)],
+                               make_clock([(0, 0), (3, 3)]))
+    stats = compute_sync_stats([spec_c, spec_d], 0, 3)
+    check("S3 非线性时钟共同段",
+          stats.common_segments == ((F(0), F(3)),))
+    check("S3 均值手算", stats.means == (F(5, 6), F(3, 2)),
+          str(stats.means))
+    check("S3 协方差手算",
+          stats.covariance == ((F(11, 36), F(17, 36)),
+                               (F(17, 36), F(3, 4))),
+          str(stats.covariance))
+    gap = _sync_float_cross_check([spec_c, spec_d], stats)
+    check("S3 独立数值积分复核", gap < 1e-9, f"max_gap={gap:.2e}")
+    # 有效窗（通道时钟 [1/2, 3/2]）经非线性时钟映到公共时间 [1, 5/2]
+    spec_e = make_channel_spec("E", pc, [(F(1, 2), F(3, 2))],
+                               make_clock([(0, 0), (1, 2), (2, 3)]))
+    stats_e = compute_sync_stats([spec_e], 0, 3)
+    check("S3 窗映射到公共时间",
+          stats_e.common_segments == ((F(1), F(5, 2)),),
+          str(stats_e.common_segments))
+    check("S3 窗内均值手算", stats_e.means == (F(11, 12),),
+          str(stats_e.means))
+    # 时钟覆盖窄于净响应域：不外推，共同段被裁短
+    spec_f = make_channel_spec("F", pc, [(0, 2)],
+                               make_clock([(0, 0), (F(3, 2), F(3, 2))]))
+    stats_f = compute_sync_stats([spec_f], 0, 3)
+    check("S3 时钟覆盖外不外推",
+          stats_f.common_segments == ((F(0), F(3, 2)),),
+          str(stats_f.common_segments))
+
+
+# S4：三路仅两两有交叠（整组无共同测度）；单点交集不提供测长
+def case_sync_pairwise_only_overlap(db: str) -> None:
+    svc = SignalService(db)
+    pa = _mk_product(svc, "PA", [(0, 1), (4, 1)], [(0, 0), (4, 0)])
+    pb = _mk_product(svc, "PB", [(0, 1), (4, 1)], [(0, 0), (4, 0)])
+    pc = _mk_product(svc, "PC", [(0, 1), (4, 1)], [(0, 0), (4, 0)])
+    svc.close()
+    ms = MeterService(db)
+    clock = [[0, 0], [4, 4]]
+    sel3 = [
+        {"name": "A", "product_id": pa.product_id, "windows": [[0, 2]],
+         "clock": clock},
+        {"name": "B", "product_id": pb.product_id, "windows": [[1, 3]],
+         "clock": clock},
+        {"name": "C", "product_id": pc.product_id,
+         "windows": [["5/2", 4]], "clock": clock},
+    ]
+    try:
+        ms.compute_sync(sel3, 0, 4)
+        check("S4 三路无共同测度拒绝", False)
+    except DomainError:
+        check("S4 三路无共同测度拒绝", True)
+    # 允许重新选取通道：两两可行
+    ab = ms.compute_sync(sel3[:2], 0, 4)
+    check("S4 重选A,B共同段", ab.common_segments == ((F(1), F(2)),),
+          str(ab.common_segments))
+    bc = ms.compute_sync([sel3[1], sel3[2]], 0, 4)
+    check("S4 重选B,C共同段",
+          bc.common_segments == ((F(5, 2), F(3)),),
+          str(bc.common_segments))
+    try:
+        ms.compute_sync([sel3[0], sel3[2]], 0, 4)
+        check("S4 A,C不相交拒绝", False)
+    except DomainError:
+        check("S4 A,C不相交拒绝", True)
+    # 单点交集不提供测长
+    sel_pt = [
+        {"name": "A", "product_id": pa.product_id, "windows": [[0, 2]],
+         "clock": clock},
+        {"name": "B", "product_id": pb.product_id, "windows": [[2, 4]],
+         "clock": clock},
+    ]
+    try:
+        ms.compute_sync(sel_pt, 0, 4)
+        check("S4 单点交集无测长", False)
+    except DomainError:
+        check("S4 单点交集无测长", True)
+    check("S4 重选后统计有效",
+          ab.total_length == F(1) and ab.means == (F(1), F(1)))
+    ms.close()
+
+
+# S5：独立噪声叠加对角、参与通道数上限、并列取字典序最小
+def case_blend_noise_and_ties(db: str) -> None:
+    svc = SignalService(db)
+    p1 = _mk_product(svc, "K1", [(0, 2), (2, 2)], [(0, 0), (2, 0)])
+    p2 = _mk_product(svc, "K2", [(0, 5), (2, 5)], [(0, 0), (2, 0)])
+    svc.close()
+    ms = MeterService(db)
+    sel = [
+        {"name": "X", "product_id": p1.product_id, "windows": [[0, 2]],
+         "clock": [[0, 0], [2, 2]]},
+        {"name": "Y", "product_id": p2.product_id, "windows": [[0, 2]],
+         "clock": [[0, 0], [2, 2]]},
+    ]
+    stats = ms.compute_sync(sel, 0, 2)
+    check("S5 恒定路零协方差",
+          all(stats.covariance[i][j] == 0
+              for i in range(2) for j in range(2)))
+    # 独立噪声互不相关 → 对角叠加 → 迫使分散
+    plan = ms.optimize(stats.sync_id, make_header(
+        "HN", ["X", "Y"], 2, noise_variances=[1, 1]))
+    check("S5 噪声迫使分散", plan.shares == (1, 1), str(plan.shares))
+    check("S5 噪声方差=1/2", plan.variance == F(1, 2))
+    check("S5 预期均值=7/2", plan.expected_mean == F(7, 2))
+    check("S5 噪声项贡献",
+          sum(t.value for t in plan.terms
+              if t.label.startswith("noise")) == F(1, 2))
+    # 无噪声全并列 → 固定通道次序下份额向量字典序最小
+    plan0 = ms.optimize(stats.sync_id, make_header("H0", ["X", "Y"], 2))
+    check("S5 并列取字典序最小", plan0.shares == (0, 2), str(plan0.shares))
+    check("S5 字典序最小者均值", plan0.expected_mean == F(5))
+    # 参与通道数上限=1：并列仍取字典序最小
+    plan1 = ms.optimize(stats.sync_id, make_header(
+        "HK", ["X", "Y"], 2, max_participants=1, noise_variances=[1, 1]))
+    check("S5 参与上限=1", plan1.shares == (0, 2), str(plan1.shares))
+    check("S5 单路噪声方差=1", plan1.variance == F(1))
+    # 噪声不对称 → 选更安静的一路
+    planq = ms.optimize(stats.sync_id, make_header(
+        "HQ", ["X", "Y"], 2, max_participants=1,
+        noise_variances=[3, F(1, 2)]))
+    check("S5 选更安静通道",
+          planq.shares == (0, 2) and planq.variance == F(1, 2))
+    ms.close()
+
+
+# S6：不可配说明与规模上限
+def case_blend_infeasible_and_limits(db: str) -> None:
+    svc = SignalService(db)
+    p1 = _mk_product(svc, "I1", [(0, 1), (2, 1)], [(0, 0), (2, 0)])
+    p2 = _mk_product(svc, "I2", [(0, 2), (2, 2)], [(0, 0), (2, 0)])
+    svc.close()
+    ms = MeterService(db)
+    sel = [
+        {"name": "X", "product_id": p1.product_id, "windows": [[0, 2]],
+         "clock": [[0, 0], [2, 2]]},
+        {"name": "Y", "product_id": p2.product_id, "windows": [[0, 2]],
+         "clock": [[0, 0], [2, 2]]},
+    ]
+    stats = ms.compute_sync(sel, 0, 2)
+    p_lo = ms.optimize(stats.sync_id, make_header(
+        "BL", ["X", "Y"], 4, min_shares=[3, 3]))
+    check("S6 下限和超D不可配",
+          not p_lo.feasible and "下限" in p_lo.reason, p_lo.reason)
+    p_k = ms.optimize(stats.sync_id, make_header(
+        "BK", ["X", "Y"], 4, min_shares=[1, 1], max_participants=1))
+    check("S6 参与上限不可配",
+          not p_k.feasible and "参与通道数上限" in p_k.reason, p_k.reason)
+    p_hi = ms.optimize(stats.sync_id, make_header(
+        "BH", ["X", "Y"], 4, max_shares=[1, 1]))
+    check("S6 上限和不足不可配",
+          not p_hi.feasible and "上限" in p_hi.reason, p_hi.reason)
+    p_top = ms.optimize(stats.sync_id, make_header(
+        "BT", ["X", "Y"], 4, max_shares=[2, 2], max_participants=1))
+    check("S6 参与上限下装不下", not p_top.feasible, p_top.reason)
+    check("S6 不可配方案可复读",
+          ms.get_plan(p_lo.plan_id)["feasible"] is False)
+    try:
+        make_header("BD", ["X", "Y"], 17)
+        check("S6 D≤16", False)
+    except LimitError:
+        check("S6 D≤16", True)
+    try:
+        make_header("BN", [f"c{i}" for i in range(7)], 4)
+        check("S6 表头≤6路", False)
+    except LimitError:
+        check("S6 表头≤6路", True)
+    specs7 = [make_channel_spec(f"c{i}", p1, [(0, 2)],
+                                make_clock([(0, 0), (2, 2)]))
+              for i in range(7)]
+    try:
+        compute_sync_stats(specs7, 0, 2)
+        check("S6 同步≤6路", False)
+    except LimitError:
+        check("S6 同步≤6路", True)
+    ms.close()
+
+
+# S7：离线交换、换表头不重读折线、源版本复查与不可变历史
+def case_sync_offline_exchange(db: str) -> None:
+    import json as _json
+
+    svc = SignalService(db)
+    pa = _mk_product(svc, "OA", [(0, 0), (1, 1), (2, 2)], [(0, 0), (2, 0)])
+    pb = _mk_product(svc, "OB", [(0, 2), (1, 1), (2, 0)], [(0, 0), (2, 0)])
+    ms = MeterService(db)
+    sel = [
+        {"name": "A", "product_id": pa.product_id, "windows": [[0, 2]],
+         "clock": [[0, 0], [2, 2]]},
+        {"name": "B", "product_id": pb.product_id, "windows": [[0, 2]],
+         "clock": [[0, 0], [2, 2]]},
+    ]
+    stats = ms.compute_sync(sel, 0, 2)
+    header = make_header("HX", ["A", "B"], 4)
+    plan = ms.optimize(stats.sync_id, header)
+
+    # 离线交换：全新空库只导入统计 JSON（库中无任何折线产品）
+    other = db + ".other"
+    ms2 = MeterService(other)
+    sid = ms2.import_sync(_json.loads(ms.export_sync_json(stats.sync_id)))
+    check("S7 离线导入同id", sid == stats.sync_id)
+    svc2 = SignalService(other)
+    check("S7 离线库无任何折线产品", svc2.list_products() == [])
+    svc2.close()
+    plan2 = ms2.optimize(sid, header)
+    check("S7 离线合成一致",
+          plan2.shares == plan.shares and plan2.variance == plan.variance
+          and plan2.plan_id == plan.plan_id)
+    ms2.close()
+
+    # 源版本复查：更正 A 的基线 → 新版本、新产品、新统计；旧对象保留
+    v2 = svc.correct_baseline("OA", [(0, 1), (2, 1)])
+    pa2 = svc.publish_product("OA", v2)
+    check("S7 基线版本追加", svc.list_baseline_versions("OA") == [1, 2])
+    reread = svc.get_product(pa.product_id)
+    check("S7 旧产品复读校验", reread.fingerprint() == pa.fingerprint())
+    sel2 = [dict(sel[0], product_id=pa2.product_id), sel[1]]
+    stats2 = ms.compute_sync(sel2, 0, 2)
+    check("S7 新源得新统计", stats2.sync_id != stats.sync_id)
+    check("S7 各通道版本随源更新",
+          [c.baseline_version for c in stats2.channels] == [2, 1])
+    old = ms.get_sync(stats.sync_id)
+    check("S7 旧统计保留旧版本",
+          [c.baseline_version for c in old.channels] == [1, 1])
+    check("S7 统计列表含两者",
+          set(ms.list_syncs()) == {stats.sync_id, stats2.sync_id})
+    # 同一统计产品挂多个表头方案（更换表头不重读折线）
+    ms.optimize(stats.sync_id,
+                make_header("HY", ["A", "B"], 4, min_shares=[3, 0]))
+    check("S7 多表头方案同统计", len(ms.list_plans(stats.sync_id)) == 2)
+    ms.close()
+    svc.close()
+
+
+# S8：输入校验
+def case_sync_input_validation(db: str) -> None:
+    svc = SignalService(db)
+    pa = _mk_product(svc, "VA", [(0, 1), (2, 1)], [(0, 0), (2, 0)])
+    pb = _mk_product(svc, "VB", [(0, 1), (2, 1)], [(0, 0), (2, 0)])
+    svc.close()
+    try:
+        make_clock([(0, 0), (1, 1), (2, 1)])
+        check("S8 公共时间严格递增", False)
+    except ValidationError:
+        check("S8 公共时间严格递增", True)
+    try:
+        make_clock([(0, 0), (0, 1)])
+        check("S8 通道时间严格递增", False)
+    except ValidationError:
+        check("S8 通道时间严格递增", True)
+    try:
+        make_clock([(0, 0)])
+        check("S8 时钟至少两锚点", False)
+    except ValidationError:
+        check("S8 时钟至少两锚点", True)
+    clock = make_clock([(0, 0), (2, 2)])
+    try:
+        make_channel_spec("A", pa, [(2, 2)], clock)
+        check("S8 窗起点<终点", False)
+    except ValidationError:
+        check("S8 窗起点<终点", True)
+    try:
+        make_channel_spec("A", pa, [], clock)
+        check("S8 至少一个有效窗", False)
+    except ValidationError:
+        check("S8 至少一个有效窗", True)
+    sa = make_channel_spec("A", pa, [(0, 2)], clock)
+    try:
+        compute_sync_stats([sa, make_channel_spec("A", pb, [(0, 2)], clock)],
+                           0, 2)
+        check("S8 通道名称唯一", False)
+    except ValidationError:
+        check("S8 通道名称唯一", True)
+    try:
+        compute_sync_stats([sa], 2, 2)
+        check("S8 请求范围a<b", False)
+    except ValidationError:
+        check("S8 请求范围a<b", True)
+    stats = compute_sync_stats(
+        [sa, make_channel_spec("B", pb, [(0, 2)], clock)], 0, 2)
+    try:
+        optimize_blend(stats, make_header("HM", ["B", "A"], 2))
+        check("S8 表头通道次序匹配", False)
+    except ValidationError:
+        check("S8 表头通道次序匹配", True)
+    try:
+        make_header("Hn", ["A"], 2, noise_variances=[F(-1)])
+        check("S8 噪声非负", False)
+    except ValidationError:
+        check("S8 噪声非负", True)
+    try:
+        make_header("Hm", ["A"], 2, min_shares=[2], max_shares=[1])
+        check("S8 下限≤上限", False)
+    except ValidationError:
+        check("S8 下限≤上限", True)
+    try:
+        make_header("Hp", ["A"], 2, max_participants=0)
+        check("S8 参与上限≥1", False)
+    except ValidationError:
+        check("S8 参与上限≥1", True)
+    try:
+        clock.to_common(F(3))
+        check("S8 时钟域外拒绝", False)
+    except DomainError:
+        check("S8 时钟域外拒绝", True)
+
+
+# S9：请求范围的裁剪与多窗合并
+def case_sync_requested_range(db: str) -> None:
+    svc = SignalService(db)
+    pa = _mk_product(svc, "RA", [(0, 0), (1, 1), (2, 2)], [(0, 0), (2, 0)])
+    svc.close()
+    ms = MeterService(db)
+    sel = [{"name": "A", "product_id": pa.product_id, "windows": [[0, 2]],
+            "clock": [[0, 0], [2, 2]]}]
+    stats = ms.compute_sync(sel, 0, 1)
+    check("S9 请求范围裁剪共同段",
+          stats.common_segments == ((F(0), F(1)),))
+    check("S9 裁剪后均值", stats.means == (F(1, 2),))
+    check("S9 裁剪后方差", stats.covariance == ((F(1, 12),),),
+          str(stats.covariance))
+    stats2 = ms.compute_sync(sel, 1, 3)
+    check("S9 超出部分裁剪不报错",
+          stats2.common_segments == ((F(1), F(2)),))
+    try:
+        ms.compute_sync(sel, 3, 4)
+        check("S9 窗外请求拒绝", False)
+    except DomainError:
+        check("S9 窗外请求拒绝", True)
+    sel2 = [{"name": "A", "product_id": pa.product_id,
+             "windows": [[0, "1/2"], ["1/2", 1], ["3/2", 2]],
+             "clock": [[0, 0], [2, 2]]}]
+    stats3 = ms.compute_sync(sel2, 0, 2)
+    check("S9 相接窗合并",
+          stats3.common_segments == ((F(0), F(1)), (F(3, 2), F(2)),),
+          str(stats3.common_segments))
+    check("S9 多段测长", stats3.total_length == F(3, 2))
+    ms.close()
+
+
 def main() -> int:
     cases = [
         case_constant_share, case_crossing_root_off_grid,
@@ -574,6 +1049,11 @@ def main() -> int:
         case_equivalent_segmentation, case_baseline_correction,
         case_domain_rejection, case_limits, case_input_validation,
         case_generic_cross_check,
+        case_sync_worked_example, case_sync_constant_channel,
+        case_sync_nonlinear_clock, case_sync_pairwise_only_overlap,
+        case_blend_noise_and_ties, case_blend_infeasible_and_limits,
+        case_sync_offline_exchange, case_sync_input_validation,
+        case_sync_requested_range,
     ]
     with tempfile.TemporaryDirectory() as tmp:
         for i, fn in enumerate(cases, start=1):

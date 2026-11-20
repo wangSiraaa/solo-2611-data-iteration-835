@@ -53,15 +53,49 @@
   产品，也能分析 `product_from_dict` 读入的外部等价产品（导入时复算校验）。
 * 组分名称只是身份：结果按方法定义顺序返回，不做字典序重排。
 
+### 5. 多路净响应的同步统计（`sync.py`）
+
+为合成表计准备可独立交换的同步统计量。每一路通道 = 已有净响应产品
+（通道时钟）+ 若干有效时间窗（通道时钟）+ 严格递增、分段线性的时钟
+锚点映射（通道时钟 → 公共时间），锚点覆盖之外**不外推**。
+
+* 公共有效段 = 请求的公共时间范围 ∩ 各路有效窗（映到公共时间）的交集；
+  **单点交集不提供测长**，直接丢弃。
+* 在共同有效段上按公共时间长度精确累计 `∫r_i` 与 `∫r_i·r_j`（通道两两
+  读数乘积的积分）：均值 = `∫r_i / L`，总体协方差 =
+  `∫r_i·r_j / L − 均值之积`。事件格（各路折点并集）内乘积是二次多项式，
+  Simpson 公式精确，全程 `Fraction`。
+* **不允许**对每一对通道分别取交集再拼矩阵——那会产生实际不存在的
+  记录批。整组通道没有正长度共同测度时抛 `DomainError`，由调用方
+  重新选取通道。
+* 统计产品列出共同有效段、各通道版本（run / 基线版本 / 净响应指纹）、
+  时钟锚点、有效窗与全部矩；以内容指纹为 id，可导出 JSON 离线交换，
+  重组时复核指纹与派生量（均值、协方差必须能由矩复算）。
+
+### 6. 受限读数合成（`blend.py` / `meter_service.py`）
+
+合成表头独立于统计产品：固定通道次序下的整数份额（总份数 D ≤ 16）、
+每通道份数上下限、参与通道数上限、每通道必须追加的独立读出噪声方差。
+各通道独立噪声互不相关，只把方差叠加到同步协方差的对角线：
+`Σ' = Σ + diag(σ²)`。以非负份数 / D 为权重，穷举全部合法整数配置
+（≤6 路、D≤16），求波动方差 `wᵀΣ'w` 最小者；并列按固定通道次序的
+份额向量取字典序最小。输出最优份额、预期均值、各对角/交叉/噪声项贡献
+（求和即总方差）；不可配时给出明确说明。
+
+`MeterService` 只读使用信号仓产品（源版本复读校验不变），统计产品与
+合成方案不可变落库；**更换表头只读取已存统计 JSON，绝不重新读取
+折线**；重新选取通道 = 新的 `compute_sync`，旧统计产品永远保留可复读。
+
 ## 规模上限（`limits.py`）
 
 每条信号 500 采样点、20 基线锚点；每方法 10 组分、每组分 30 权重节点；
-50 次分析（缓存命中不计入）。
+50 次分析（缓存命中不计入）；同步统计一次至多 6 路通道，合成表头
+总份数 D 至多 16。
 
 ## 入口
 
 ```bash
-# 完整自动化验证（54 项断言，含手算例与三路径积分核对）
+# 完整自动化验证（135 项断言，含手算例与独立积分核对）
 python -m chroma_quant.validation
 
 # 可复跑端到端演示
@@ -81,6 +115,22 @@ python -m chroma_quant.cli analyze --db demo.sqlite --method M --product <PID>
 python -m chroma_quant.cli explain --db demo.sqlite --method M --product <PID>
 python -m chroma_quant.cli export-product --db demo.sqlite --product <PID> > p.json
 python -m chroma_quant.cli import-product --db other.sqlite --file p.json
+
+# 多路同步统计与受限合成
+python -m chroma_quant.cli sync --db demo.sqlite --selection sel.json
+#   sel.json: {"range": ["0/1","2/1"], "channels": [{"name": "A",
+#     "product_id": "<PID>", "windows": [["0/1","2/1"]],
+#     "clock": [["0/1","0/1"],["2/1","2/1"]]}, ...]}
+python -m chroma_quant.cli syncs --db demo.sqlite
+python -m chroma_quant.cli sync-show --db demo.sqlite --sync <SYNC_ID> > s.json
+python -m chroma_quant.cli import-sync --db other.sqlite --file s.json
+python -m chroma_quant.cli blend --db demo.sqlite --sync <SYNC_ID> --header h.json
+#   h.json: {"header_id": "H", "channels": ["A","B"], "total_shares": 4,
+#     "min_shares": [0,0], "max_shares": [4,4], "max_participants": 2,
+#     "noise_variances": ["0/1","0/1"]}   # 后四项可缺省
+python -m chroma_quant.cli blend-offline --sync-file s.json --header h.json
+python -m chroma_quant.cli plans --db demo.sqlite --sync <SYNC_ID>
+python -m chroma_quant.cli plan-show --db demo.sqlite --plan <PLAN_ID>
 ```
 
 ## 验证案例（`validation.py`）
@@ -98,3 +148,12 @@ python -m chroma_quant.cli import-product --db other.sqlite --file p.json
 | C9 | 500/20/10/30/50 全部规模上限 |
 | C10 | 严格递增、权重非负、正因子、名称唯一等输入校验 |
 | C11 | 净响应与权重折点交错的通用案例，三条积分路径两两一致 |
+| S1 | 题面手算例：A=t、B=2−t、D=4 → 2:2 方差 0；A≥3 份 → 3:1 方差 1/12；指纹核查与篡改拒绝 |
+| S2 | 固定原表头、B 改恒定 1 → 全部选 B（方差 0） |
+| S3 | 非线性时钟段（斜率变化的锚点映射）、窗经时钟映射、覆盖外不外推、独立数值积分复核 |
+| S4 | 三路仅两两有交叠→整组拒绝、重新选路可行；单点交集不提供测长 |
+| S5 | 独立噪声叠加对角迫使分散、参与通道数上限、并列取字典序最小 |
+| S6 | 下限和/上限和/参与数导致的不可配说明；D≤16、≤6 路上限 |
+| S7 | 统计产品离线交换（无折线的新库复算一致）、源版本复查、不可变历史、多表头同统计 |
+| S8 | 时钟单调性、有效窗、重名、表头通道次序、噪声非负等输入校验 |
+| S9 | 请求范围裁剪、窗外拒绝、相接窗合并与多段测长 |

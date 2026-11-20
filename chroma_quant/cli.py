@@ -16,6 +16,9 @@
       --components 'A:2:(0,1;3,1) B:5:(2,1;3,2)'
   python -m chroma_quant.cli analyze --db demo.sqlite --method M --product PID
   python -m chroma_quant.cli explain --db demo.sqlite --method M --product PID
+  python -m chroma_quant.cli sync --db demo.sqlite --selection sel.json
+  python -m chroma_quant.cli blend --db demo.sqlite --sync SYNC_ID --header h.json
+  python -m chroma_quant.cli blend-offline --sync-file s.json --header h.json
   python -m chroma_quant.cli validate
 """
 from __future__ import annotations
@@ -25,10 +28,13 @@ import json
 import sys
 from fractions import Fraction
 
+from .blend import header_from_dict, optimize_blend, plan_to_dict
 from .errors import ChromaError
+from .meter_service import MeterService
 from .rational import frac_str
 from .repository import QuantRepository
 from .signal_service import SignalService
+from .sync import sync_stats_from_dict, sync_stats_to_dict
 from . import validation as validation_mod
 
 
@@ -180,6 +186,74 @@ def cmd_validate(args) -> None:
     raise SystemExit(rc)
 
 
+# ----------------------------------------------------------------------
+# 多路同步统计与受限合成
+# ----------------------------------------------------------------------
+def _load_json_file(path: str):
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def cmd_sync(args) -> None:
+    """selection JSON: {"range": [a, b], "channels": [{"name",
+    "product_id", "windows": [[lo, hi], ...],
+    "clock": [[通道时间, 公共时间], ...]}, ...]}"""
+    ms = MeterService(args.db)
+    spec = _load_json_file(args.selection)
+    stats = ms.compute_sync(spec["channels"], spec["range"][0],
+                            spec["range"][1])
+    print(json.dumps(sync_stats_to_dict(stats), ensure_ascii=False,
+                     indent=2))
+    ms.close()
+
+
+def cmd_syncs(args) -> None:
+    ms = MeterService(args.db)
+    print(json.dumps(ms.list_syncs(), ensure_ascii=False, indent=2))
+    ms.close()
+
+
+def cmd_sync_show(args) -> None:
+    ms = MeterService(args.db)
+    print(ms.export_sync_json(args.sync))
+    ms.close()
+
+
+def cmd_import_sync(args) -> None:
+    ms = MeterService(args.db)
+    print(ms.import_sync(_load_json_file(args.file)))
+    ms.close()
+
+
+def cmd_blend(args) -> None:
+    ms = MeterService(args.db)
+    plan = ms.optimize(args.sync, header_from_dict(
+        _load_json_file(args.header)))
+    print(json.dumps(plan_to_dict(plan), ensure_ascii=False, indent=2))
+    ms.close()
+
+
+def cmd_blend_offline(args) -> None:
+    """不接触任何数据库：统计产品与表头都来自 JSON 文件。"""
+    stats = sync_stats_from_dict(_load_json_file(args.sync_file))
+    plan = optimize_blend(stats, header_from_dict(
+        _load_json_file(args.header)))
+    print(json.dumps(plan_to_dict(plan), ensure_ascii=False, indent=2))
+
+
+def cmd_plans(args) -> None:
+    ms = MeterService(args.db)
+    print(json.dumps(ms.list_plans(args.sync), ensure_ascii=False,
+                     indent=2))
+    ms.close()
+
+
+def cmd_plan_show(args) -> None:
+    ms = MeterService(args.db)
+    print(json.dumps(ms.get_plan(args.plan), ensure_ascii=False, indent=2))
+    ms.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="chroma_quant",
@@ -251,6 +325,44 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--product", required=True)
 
     sp = sub.add_parser("validate"); sp.set_defaults(func=cmd_validate)
+
+    sp = sub.add_parser("sync", help="计算多路同步统计产品")
+    sp.set_defaults(func=cmd_sync)
+    sp.add_argument("--db", required=True)
+    sp.add_argument("--selection", required=True,
+                    help='JSON: {"range":[a,b],"channels":[...]}')
+
+    sp = sub.add_parser("syncs", help="列出同步统计产品")
+    sp.set_defaults(func=cmd_syncs)
+    sp.add_argument("--db", required=True)
+
+    sp = sub.add_parser("sync-show"); sp.set_defaults(func=cmd_sync_show)
+    sp.add_argument("--db", required=True)
+    sp.add_argument("--sync", required=True)
+
+    sp = sub.add_parser("import-sync"); sp.set_defaults(func=cmd_import_sync)
+    sp.add_argument("--db", required=True)
+    sp.add_argument("--file", required=True)
+
+    sp = sub.add_parser("blend", help="在表头约束下求最小波动配比")
+    sp.set_defaults(func=cmd_blend)
+    sp.add_argument("--db", required=True)
+    sp.add_argument("--sync", required=True)
+    sp.add_argument("--header", required=True, help="合成表头 JSON 文件")
+
+    sp = sub.add_parser("blend-offline",
+                        help="不用数据库：统计产品与表头都来自文件")
+    sp.set_defaults(func=cmd_blend_offline)
+    sp.add_argument("--sync-file", required=True)
+    sp.add_argument("--header", required=True)
+
+    sp = sub.add_parser("plans"); sp.set_defaults(func=cmd_plans)
+    sp.add_argument("--db", required=True)
+    sp.add_argument("--sync")
+
+    sp = sub.add_parser("plan-show"); sp.set_defaults(func=cmd_plan_show)
+    sp.add_argument("--db", required=True)
+    sp.add_argument("--plan", required=True)
     return p
 
 
